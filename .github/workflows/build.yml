@@ -1,0 +1,41 @@
+name: Build Windows client
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build client and MSI
+        shell: pwsh
+        run: .\build-installer.ps1 -Version 1.0.${{ github.run_number }}
+
+      - name: Upload portable client
+        uses: actions/upload-artifact@v4
+        with:
+          name: StarTrace-win-x64
+          path: artifacts/win-x64/**
+          if-no-files-found: error
+      - name: Upload MSI installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: StarTrace-Setup-x64
+          path: artifacts/installer/StarTrace-Setup-x64.msi
+          if-no-files-found: error

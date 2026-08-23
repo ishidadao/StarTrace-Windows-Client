@@ -1,0 +1,18 @@
+<Project Sdk="WixToolset.Sdk/6.0.2">
+  <PropertyGroup>
+    <OutputType>Package</OutputType>
+    <OutputName>StarTrace-Setup-x64</OutputName>
+    <Platform>x64</Platform>
+    <InstallerPlatform>x64</InstallerPlatform>
+    <InstallerVersion Condition="'$(InstallerVersion)' == ''">1.0.0</InstallerVersion>
+    <PublishDir Condition="'$(PublishDir)' == ''">$(MSBuildThisFileDirectory)..\StarTrace.Client\bin\x64\Release\net8.0-windows10.0.19041.0\win-x64\publish</PublishDir>
+    <DefineConstants>$(DefineConstants);PublishDir=$(PublishDir);SourceRoot=$(MSBuildThisFileDirectory)..;InstallerVersion=$(InstallerVersion)</DefineConstants>
+    <Cultures>zh-CN</Cultures>
+    <!-- Several Windows App SDK runtime DLLs carry multi-LCID version metadata
+         that Windows Installer's legacy ICE03 validator cannot represent. -->
+    <SuppressIces>ICE03</SuppressIces>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="WixToolset.UI.wixext" Version="6.0.2" />
+  </ItemGroup>
+</Project>
