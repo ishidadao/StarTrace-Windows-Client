@@ -8,9 +8,14 @@ namespace StarTrace.Client.Services;
 public sealed class LocalDataService
 {
     private readonly SemaphoreSlim _gate = new(1, 1);
-    private readonly string _filePath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "StarTrace", "client-data.json");
+    private readonly string _filePath;
     private readonly JsonSerializerOptions _json = new() { WriteIndented = true };
+
+    public LocalDataService(string? filePath = null)
+    {
+        _filePath = filePath ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "StarTrace", "client-data.json");
+    }
 
     public async Task<FetchResult?> LoadLatestAsync(CancellationToken token = default)
     {
@@ -81,24 +86,35 @@ public sealed class LocalDataService
     public async Task<IReadOnlyList<PendingAccount>> GetPendingAsync(CancellationToken token = default) =>
         (await ReadAsync(token)).Pending.ToList();
 
-    public async Task SaveCloudSettingsAsync(string baseUrl, string accessToken, string username, CancellationToken token = default)
+    public async Task SaveIdentitySettingsAsync(IdentityLogin login, CancellationToken token = default)
     {
-        if (!CloudSyncService.TryNormalizeBaseUrl(baseUrl, out var normalizedBaseUrl))
-            throw new ArgumentException("请输入有效的 HTTP 或 HTTPS 星迹服务器地址。", nameof(baseUrl));
-        var protectedBytes = ProtectedData.Protect(Encoding.UTF8.GetBytes(accessToken.Trim()), null, DataProtectionScope.CurrentUser);
+        var access = ProtectedData.Protect(Encoding.UTF8.GetBytes(login.AccessToken), null, DataProtectionScope.CurrentUser);
+        var refresh = ProtectedData.Protect(Encoding.UTF8.GetBytes(login.RefreshToken), null, DataProtectionScope.CurrentUser);
         await UpdateAsync(state =>
         {
-            state.ServerUrl = normalizedBaseUrl;
-            state.ProtectedAccessToken = Convert.ToBase64String(protectedBytes);
-            state.Username = username.Trim();
+            state.ServerUrl = IdentityLoginService.ApiOrigin;
+            state.ProtectedAccessToken = Convert.ToBase64String(access);
+            state.ProtectedRefreshToken = Convert.ToBase64String(refresh);
+            state.AccessTokenExpiresAt = login.ExpiresAt;
+            state.Username = login.Username;
             state.ProtectedSyncKey = "";
         }, token);
     }
+
+    public Task ClearCloudLoginAsync(CancellationToken token = default) => UpdateAsync(state =>
+    {
+        state.ProtectedAccessToken = "";
+        state.ProtectedRefreshToken = "";
+        state.AccessTokenExpiresAt = null;
+        state.ProtectedSyncKey = "";
+        state.Username = "";
+    }, token);
 
     public async Task<CloudSettings> GetCloudSettingsAsync(CancellationToken token = default)
     {
         var state = await ReadAsync(token);
         var accessToken = "";
+        var refreshToken = "";
         if (!string.IsNullOrWhiteSpace(state.ProtectedAccessToken))
         {
             try
@@ -108,10 +124,19 @@ public sealed class LocalDataService
             }
             catch { }
         }
+        if (!string.IsNullOrWhiteSpace(state.ProtectedRefreshToken))
+        {
+            try
+            {
+                refreshToken = Encoding.UTF8.GetString(ProtectedData.Unprotect(
+                    Convert.FromBase64String(state.ProtectedRefreshToken), null, DataProtectionScope.CurrentUser));
+            }
+            catch { }
+        }
         return new CloudSettings(
             CloudSyncService.TryNormalizeBaseUrl(state.ServerUrl, out var normalizedBaseUrl) ? normalizedBaseUrl : "",
             accessToken,
-            state.Username);
+            state.Username, refreshToken, state.AccessTokenExpiresAt);
     }
 
     private async Task<LocalState> ReadAsync(CancellationToken token)
@@ -182,7 +207,11 @@ public sealed class LocalDataService
     }
 }
 
-public sealed record CloudSettings(string BaseUrl, string AccessToken, string Username);
+public sealed record CloudSettings(string BaseUrl, string AccessToken, string Username, string RefreshToken = "", DateTimeOffset? ExpiresAt = null)
+{
+    public bool UsesUnifiedIdentity => BaseUrl.TrimEnd('/') == IdentityLoginService.ApiOrigin &&
+        !string.IsNullOrWhiteSpace(AccessToken) && !string.IsNullOrWhiteSpace(RefreshToken) && ExpiresAt is not null;
+}
 public sealed class PendingAccount { public string Game { get; set; } = ""; public string Uid { get; set; } = ""; }
 public sealed class LocalAccount
 {
@@ -196,6 +225,8 @@ public sealed class LocalState
     public string ServerUrl { get; set; } = "";
     public string Username { get; set; } = "";
     public string ProtectedAccessToken { get; set; } = "";
+    public string ProtectedRefreshToken { get; set; } = "";
+    public DateTimeOffset? AccessTokenExpiresAt { get; set; }
     // Kept only so older local files can be read; legacy sync keys are never reused.
     public string ProtectedSyncKey { get; set; } = "";
     public List<LocalAccount> Accounts { get; set; } = [];

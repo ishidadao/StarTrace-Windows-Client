@@ -16,11 +16,11 @@ namespace StarTrace.Client;
 
 public sealed partial class MainWindow : Window
 {
-    private const string ServerPlaceholder = "https://your-startrace-server.example.com";
     private readonly HttpClient _httpClient = new() { Timeout = TimeSpan.FromSeconds(45) };
     private readonly GenshinGachaService _genshin;
     private readonly WutheringWavesGachaService _wutheringWaves;
     private readonly CloudSyncService _sync;
+    private readonly IdentityLoginService _identity = new();
     private readonly ItemIconService _icons;
     private readonly GameRecordDiscoveryService _discovery = new();
     private readonly LocalDataService _local = new();
@@ -32,6 +32,8 @@ public sealed partial class MainWindow : Window
     private readonly Button _autoFetchButton;
     private readonly Button _manualFetchButton;
     private readonly Button _syncButton;
+    private readonly Button _logoutButton = SecondaryButton("退出登录");
+    private readonly Button _cancelLoginButton = SecondaryButton("取消登录");
     private readonly Button _importButton;
     private readonly Button _exportButton;
     private readonly TextBlock _statusText = Text("正在准备本地数据…", 11, "#6F7187");
@@ -48,6 +50,7 @@ public sealed partial class MainWindow : Window
     private FetchResult? _current;
     private bool _serverReachable;
     private readonly CancellationTokenSource _iconCancellation = new();
+    private CancellationTokenSource? _loginCancellation;
 
     public MainWindow()
     {
@@ -59,7 +62,7 @@ public sealed partial class MainWindow : Window
         _icons = new ItemIconService(_httpClient);
         _autoFetchButton = PrimaryButton("一键读取记录", "\uE8C8");
         _manualFetchButton = SecondaryButton("使用此链接");
-        _syncButton = PrimaryButton("配置同步", "\uE753");
+        _syncButton = PrimaryButton("统一认证登录", "\uE753");
         _importButton = SecondaryButton("导入 UIGF");
         _exportButton = SecondaryButton("导出 UIGF");
         ExtendsContentIntoTitleBar = true;
@@ -72,7 +75,9 @@ public sealed partial class MainWindow : Window
         Closed += (_, _) =>
         {
             _iconCancellation.Cancel();
+            _loginCancellation?.Cancel();
             _iconCancellation.Dispose();
+            _sync.Dispose();
             _httpClient.Dispose();
         };
     }
@@ -231,6 +236,10 @@ public sealed partial class MainWindow : Window
         _autoFetchButton.Click += AutoFetchButton_Click;
         _manualFetchButton.Click += ManualFetchButton_Click;
         _syncButton.Click += SyncButton_Click;
+        _logoutButton.Click += LogoutButton_Click;
+        _cancelLoginButton.Click += (_, _) => _loginCancellation?.Cancel();
+        _logoutButton.Visibility = Visibility.Collapsed;
+        _cancelLoginButton.Visibility = Visibility.Collapsed;
         _importButton.Click += ImportButton_Click;
         _exportButton.Click += ExportButton_Click;
         _manualUrlBox.PlaceholderText = "高级方式：粘贴 getGachaLog 或唤取记录完整链接";
@@ -266,6 +275,8 @@ public sealed partial class MainWindow : Window
         buttons.Children.Add(_importButton);
         buttons.Children.Add(_exportButton);
         buttons.Children.Add(_syncButton);
+        buttons.Children.Add(_cancelLoginButton);
+        buttons.Children.Add(_logoutButton);
         Grid.SetColumn(buttons, 1);
         actions.Children.Add(buttons);
         body.Children.Add(actions);
@@ -336,14 +347,15 @@ public sealed partial class MainWindow : Window
         try
         {
             var settings = await _local.GetCloudSettingsAsync();
+            UpdateIdentityUi(settings);
             var local = await _local.LoadLatestAsync();
             if (local is not null) ShowData(local);
-            if (string.IsNullOrWhiteSpace(settings.BaseUrl))
+            if (!settings.UsesUnifiedIdentity)
             {
                 SetConnection(null);
                 _statusText.Text = local is null
-                    ? "本地模式 · 配置自托管服务器后可启用账号同步"
-                    : "本地记录已就绪 · 尚未配置同步服务器";
+                    ? "本地模式 · 点击“统一认证登录”后可同步"
+                    : "本地记录已就绪 · 请使用统一认证登录";
                 return;
             }
             _statusText.Text = "正在检查星迹服务…";
@@ -399,7 +411,7 @@ public sealed partial class MainWindow : Window
     {
         if (_current is null) return;
         var settings = await _local.GetCloudSettingsAsync();
-        if (string.IsNullOrWhiteSpace(settings.AccessToken))
+        if (!settings.UsesUnifiedIdentity)
         {
             _statusText.Text = $"已安全保存在本机 · UID {_current.Uid} · {_current.Records.Count} 条";
             return;
@@ -412,6 +424,7 @@ public sealed partial class MainWindow : Window
             _statusText.Text = $"已保存在本机并加入待同步队列 · UID {_current.Uid}";
             return;
         }
+        settings = await RefreshIdentityIfNeededAsync(settings);
         var count = await _sync.UploadAsync(settings.BaseUrl, settings.AccessToken, _current.Game, _current.Records);
         await _local.MarkSyncedAsync(_current.Game, _current.Uid);
         _statusText.Text = $"本地已保存，云端已同步 {count} 条 · UID {_current.Uid}";
@@ -419,38 +432,64 @@ public sealed partial class MainWindow : Window
 
     private async void SyncButton_Click(object sender, RoutedEventArgs e)
     {
-        var currentSettings = await _local.GetCloudSettingsAsync();
-        var address = new TextBox { Header = "星迹服务器地址", Text = currentSettings.BaseUrl, PlaceholderText = ServerPlaceholder };
-        var username = new TextBox { Header = "用户名", Text = currentSettings.Username, PlaceholderText = "先在星迹网站注册账号" };
-        var password = new PasswordBox { Header = "密码", PlaceholderText = "至少 10 位" };
-        var panel = new StackPanel { Spacing = 12 };
-        panel.Children.Add(Text("填写你信任的自托管星迹服务器。访问令牌会由 Windows DPAPI 加密保存在当前系统用户下；原神与鸣潮仍按游戏和 UID 分组。", 10, "#777A91", null, TextAlignment.Left, VerticalAlignment.Top, true));
-        panel.Children.Add(address);
-        panel.Children.Add(username);
-        panel.Children.Add(password);
-        var dialog = new ContentDialog { Title = "连接星迹服务器", Content = panel, PrimaryButtonText = "登录并同步", CloseButtonText = "取消", XamlRoot = _root.XamlRoot };
-        if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
-        if (!CloudSyncService.TryNormalizeBaseUrl(address.Text, out var baseUrl)) { _statusText.Text = "请输入有效的 HTTP 或 HTTPS 星迹服务器地址"; return; }
-        if (string.IsNullOrWhiteSpace(username.Text) || password.Password.Length < 10) { _statusText.Text = "请输入用户名和至少 10 位密码"; return; }
         SetBusy(true);
         try
         {
-            _serverReachable = await _sync.IsServerReachableAsync(baseUrl);
+            var settings = await _local.GetCloudSettingsAsync();
+            _serverReachable = await _sync.IsServerReachableAsync(IdentityLoginService.ApiOrigin);
             SetConnection(_serverReachable);
             if (!_serverReachable)
             {
                 _statusText.Text = "服务暂不可达；已有令牌和记录保持不变，下次启动会自动重试";
                 return;
             }
-            var login = await _sync.LoginAsync(baseUrl, username.Text, password.Password);
-            await _local.SaveCloudSettingsAsync(baseUrl, login.AccessToken, login.Username);
+            if (!settings.UsesUnifiedIdentity)
+            {
+                _loginCancellation = new CancellationTokenSource();
+                _cancelLoginButton.Visibility = Visibility.Visible;
+                _statusText.Text = "请在浏览器中完成统一认证，完成后会自动返回客户端…";
+                var login = await _identity.LoginAsync(_loginCancellation.Token);
+                await _local.SaveIdentitySettingsAsync(login);
+                settings = await _local.GetCloudSettingsAsync();
+                UpdateIdentityUi(settings);
+            }
             if (_current is not null) await _local.QueueSyncAsync(_current.Game, _current.Uid);
-            var settings = await _local.GetCloudSettingsAsync();
             var uploaded = await FlushPendingAsync(settings);
-            _statusText.Text = $"已登录 {login.Username}，同步完成，共写入 {uploaded} 条记录";
+            _statusText.Text = $"已登录 {settings.Username}，同步完成，共写入 {uploaded} 条记录";
         }
+        catch (OperationCanceledException) { _statusText.Text = "已取消统一认证，本地记录保持不变。"; }
         catch (Exception ex) { _statusText.Text = $"同步失败，记录仍保留在本机：{ex.Message}"; }
+        finally
+        {
+            _cancelLoginButton.Visibility = Visibility.Collapsed;
+            _loginCancellation?.Dispose();
+            _loginCancellation = null;
+            SetBusy(false);
+        }
+    }
+
+    private async void LogoutButton_Click(object sender, RoutedEventArgs e)
+    {
+        SetBusy(true);
+        try
+        {
+            var settings = await _local.GetCloudSettingsAsync();
+            await _local.ClearCloudLoginAsync();
+            UpdateIdentityUi(await _local.GetCloudSettingsAsync());
+            _statusText.Text = "已退出客户端登录，本地记录和待同步队列已保留。";
+            await _identity.RevokeAsync(settings);
+        }
+        catch (Exception ex) { _statusText.Text = $"退出登录失败：{ex.Message}"; }
         finally { SetBusy(false); }
+    }
+
+    private void UpdateIdentityUi(CloudSettings settings)
+    {
+        if (_syncButton.Content is StackPanel panel && panel.Children.LastOrDefault() is TextBlock label)
+            label.Text = settings.UsesUnifiedIdentity ? "同步记录" : "统一认证登录";
+        _logoutButton.Visibility = settings.UsesUnifiedIdentity ? Visibility.Visible : Visibility.Collapsed;
+        ToolTipService.SetToolTip(_syncButton, settings.UsesUnifiedIdentity
+            ? $"当前账号：{settings.Username}" : "使用 Ishidadao ID 登录星迹");
     }
 
     private async void ImportButton_Click(object sender, RoutedEventArgs e)
@@ -465,12 +504,12 @@ public sealed partial class MainWindow : Window
             {
                 var merged = await _local.MergeAsync(group);
                 _current ??= merged;
-                if (!string.IsNullOrWhiteSpace(settings.AccessToken)) await _local.QueueSyncAsync(merged.Game, merged.Uid);
+                if (settings.UsesUnifiedIdentity) await _local.QueueSyncAsync(merged.Game, merged.Uid);
             }
             _current = await _local.LoadAccountAsync(groups[0].Game, groups[0].Uid);
             if (_current is not null) ShowData(_current);
             var imported = groups.Sum(group => group.Records.Count);
-            if (!string.IsNullOrWhiteSpace(settings.AccessToken) && await _sync.IsServerReachableAsync(settings.BaseUrl))
+            if (settings.UsesUnifiedIdentity && await _sync.IsServerReachableAsync(settings.BaseUrl))
             {
                 var uploaded = await FlushPendingAsync(settings);
                 _statusText.Text = $"UIGF 导入 {imported} 条，云端同步 {uploaded} 条";
@@ -492,6 +531,8 @@ public sealed partial class MainWindow : Window
 
     private async Task<int> FlushPendingAsync(CloudSettings settings)
     {
+        if ((await _local.GetPendingAsync()).Count == 0) return 0;
+        settings = await RefreshIdentityIfNeededAsync(settings);
         var total = 0;
         foreach (var pending in await _local.GetPendingAsync())
         {
@@ -501,6 +542,16 @@ public sealed partial class MainWindow : Window
             await _local.MarkSyncedAsync(account.Game, account.Uid);
         }
         return total;
+    }
+
+    private async Task<CloudSettings> RefreshIdentityIfNeededAsync(CloudSettings settings)
+    {
+        if (!settings.UsesUnifiedIdentity)
+            throw new InvalidOperationException("请先统一认证登录；本地记录保持不变。");
+        if (settings.ExpiresAt > DateTimeOffset.UtcNow.AddMinutes(2)) return settings;
+        var renewed = await _identity.RefreshAsync(settings.RefreshToken, settings.Username);
+        await _local.SaveIdentitySettingsAsync(renewed);
+        return await _local.GetCloudSettingsAsync();
     }
 
     private void ShowData(FetchResult data)
@@ -688,6 +739,7 @@ public sealed partial class MainWindow : Window
         _autoFetchButton.IsEnabled = !busy;
         _manualFetchButton.IsEnabled = !busy;
         _syncButton.IsEnabled = !busy;
+        _logoutButton.IsEnabled = !busy;
         _importButton.IsEnabled = !busy && CurrentGame == "genshin";
         _exportButton.IsEnabled = !busy && _current?.Game == "genshin";
         if (busy) _statusText.Text = "处理中…";
@@ -700,7 +752,7 @@ public sealed partial class MainWindow : Window
         {
             true => "星迹服务在线",
             false => "离线模式 · 本地保存",
-            null => "未配置服务器 · 本地模式",
+            null => "未登录 · 本地模式",
         };
     }
 

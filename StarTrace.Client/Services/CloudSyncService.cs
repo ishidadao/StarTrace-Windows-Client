@@ -4,8 +4,9 @@ using StarTrace.Client.Models;
 
 namespace StarTrace.Client.Services;
 
-public sealed class CloudSyncService(HttpClient client)
+public sealed class CloudSyncService(HttpClient client) : IDisposable
 {
+    private readonly HttpClient _apiClient = new(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(45) };
     public static bool TryNormalizeBaseUrl(string? value, out string normalized)
     {
         normalized = "";
@@ -31,9 +32,10 @@ public sealed class CloudSyncService(HttpClient client)
             throw new ArgumentException("网站地址无效。");
         if (string.IsNullOrWhiteSpace(accessToken)) throw new ArgumentException("请先登录星迹账号。");
 
+        RequireOfficialOrigin(normalizedBaseUrl);
         using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
         request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken.Trim());
-        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
+        using var response = await _apiClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, token);
         var responseText = await response.Content.ReadAsStringAsync(token);
         if (!response.IsSuccessStatusCode) throw new InvalidOperationException(ReadError(responseText, "读取云端记录失败。"));
         using var json = JsonDocument.Parse(responseText);
@@ -78,21 +80,6 @@ public sealed class CloudSyncService(HttpClient client)
         catch { return false; }
     }
 
-    public async Task<CloudLogin> LoginAsync(string baseUrl, string username, string password, CancellationToken token = default)
-    {
-        if (!TryNormalizeBaseUrl(baseUrl, out var normalizedBaseUrl) ||
-            !Uri.TryCreate(normalizedBaseUrl + "/api/auth/login", UriKind.Absolute, out var endpoint))
-            throw new ArgumentException("网站地址无效。");
-        using var response = await client.PostAsJsonAsync(endpoint, new { username = username.Trim(), password }, token);
-        var responseText = await response.Content.ReadAsStringAsync(token);
-        if (!response.IsSuccessStatusCode) throw new InvalidOperationException(ReadError(responseText, "登录失败。"));
-        using var json = JsonDocument.Parse(responseText);
-        var accessToken = json.RootElement.GetProperty("accessToken").GetString() ?? "";
-        var normalizedUsername = json.RootElement.GetProperty("user").GetProperty("username").GetString() ?? username.Trim();
-        if (string.IsNullOrWhiteSpace(accessToken)) throw new InvalidOperationException("服务器没有返回登录令牌。");
-        return new CloudLogin(normalizedUsername, accessToken);
-    }
-
     public async Task<int> UploadAsync(string baseUrl, string accessToken, string game, IEnumerable<GachaRecord> records, CancellationToken token = default)
     {
         if (!TryNormalizeBaseUrl(baseUrl, out var normalizedBaseUrl) ||
@@ -100,6 +87,7 @@ public sealed class CloudSyncService(HttpClient client)
             throw new ArgumentException("网站地址无效。");
         if (string.IsNullOrWhiteSpace(accessToken)) throw new ArgumentException("请先登录星迹账号。");
 
+        RequireOfficialOrigin(normalizedBaseUrl);
         if (game is not ("genshin" or "wuwa")) throw new ArgumentException("游戏来源无效。");
         var groups = records.GroupBy(record => (Game: game, record.Uid));
         var total = 0;
@@ -109,7 +97,7 @@ public sealed class CloudSyncService(HttpClient client)
             var payload = new { game = group.Key.Game, uid = group.Key.Uid, source = "winui-client", records = group.ToList() };
             using var request = new HttpRequestMessage(HttpMethod.Post, endpoint) { Content = JsonContent.Create(payload) };
             request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken.Trim());
-            using var response = await client.SendAsync(request, token);
+            using var response = await _apiClient.SendAsync(request, token);
             var responseText = await response.Content.ReadAsStringAsync(token);
             if (!response.IsSuccessStatusCode)
             {
@@ -134,6 +122,12 @@ public sealed class CloudSyncService(HttpClient client)
                 return value.ToString();
         return "";
     }
-}
 
-public sealed record CloudLogin(string Username, string AccessToken);
+    private static void RequireOfficialOrigin(string baseUrl)
+    {
+        if (baseUrl != IdentityLoginService.ApiOrigin)
+            throw new InvalidOperationException("统一认证令牌只能发送到正式星迹服务。");
+    }
+
+    public void Dispose() => _apiClient.Dispose();
+}

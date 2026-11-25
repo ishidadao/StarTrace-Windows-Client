@@ -23,6 +23,10 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
+      - name: Test unified authentication
+        shell: pwsh
+        run: dotnet run --project .\Identity.Tests\Identity.Tests.csproj -c Release
+
       - name: Build client and MSI
         shell: pwsh
         run: .\build-installer.ps1 -Version 1.0.${{ github.run_number }}
