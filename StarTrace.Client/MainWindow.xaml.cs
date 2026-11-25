@@ -8,6 +8,8 @@ using StarTrace.Client.Models;
 using StarTrace.Client.Services;
 using Windows.Foundation;
 using Windows.Storage.Streams;
+using Windows.Storage.Pickers;
+using WinRT.Interop;
 using Microsoft.UI.Xaml.Shapes;
 using FontWeight = Windows.UI.Text.FontWeight;
 using FontWeights = Microsoft.UI.Text.FontWeights;
@@ -32,6 +34,8 @@ public sealed partial class MainWindow : Window
     private readonly Button _autoFetchButton;
     private readonly Button _manualFetchButton;
     private readonly Button _syncButton;
+    private readonly Button _uploadAllButton = SecondaryButton("一键上传");
+    private readonly Button _backupButton = SecondaryButton("一键导出");
     private readonly Button _logoutButton = SecondaryButton("退出登录");
     private readonly Button _cancelLoginButton = SecondaryButton("取消登录");
     private readonly Button _importButton;
@@ -51,6 +55,8 @@ public sealed partial class MainWindow : Window
     private bool _serverReachable;
     private readonly CancellationTokenSource _iconCancellation = new();
     private CancellationTokenSource? _loginCancellation;
+    private bool _hasUnifiedLogin;
+    private bool? _connectionOnline;
 
     public MainWindow()
     {
@@ -236,6 +242,10 @@ public sealed partial class MainWindow : Window
         _autoFetchButton.Click += AutoFetchButton_Click;
         _manualFetchButton.Click += ManualFetchButton_Click;
         _syncButton.Click += SyncButton_Click;
+        _uploadAllButton.Click += UploadAllButton_Click;
+        _backupButton.Click += BackupButton_Click;
+        ToolTipService.SetToolTip(_uploadAllButton, "上传原神、鸣潮全部本地 UID；未登录时会先打开统一认证");
+        ToolTipService.SetToolTip(_backupButton, "导出原神、鸣潮全部本地记录，不需要登录或联网");
         _logoutButton.Click += LogoutButton_Click;
         _cancelLoginButton.Click += (_, _) => _loginCancellation?.Cancel();
         _logoutButton.Visibility = Visibility.Collapsed;
@@ -264,9 +274,7 @@ public sealed partial class MainWindow : Window
         row.Children.Add(_autoFetchButton);
         body.Children.Add(row);
 
-        var actions = new Grid();
-        actions.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        actions.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var actions = new StackPanel { Spacing = 10 };
         var status = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8, VerticalAlignment = VerticalAlignment.Center };
         status.Children.Add(new FontIcon { Glyph = "\uE946", FontSize = 13, Foreground = Brush("#7B69E6") });
         status.Children.Add(_statusText);
@@ -274,10 +282,11 @@ public sealed partial class MainWindow : Window
         var buttons = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
         buttons.Children.Add(_importButton);
         buttons.Children.Add(_exportButton);
+        buttons.Children.Add(_backupButton);
+        buttons.Children.Add(_uploadAllButton);
         buttons.Children.Add(_syncButton);
         buttons.Children.Add(_cancelLoginButton);
         buttons.Children.Add(_logoutButton);
-        Grid.SetColumn(buttons, 1);
         actions.Children.Add(buttons);
         body.Children.Add(actions);
 
@@ -344,23 +353,23 @@ public sealed partial class MainWindow : Window
 
     private async Task InitializeAsync()
     {
+        SetBusy(true);
         try
         {
             var settings = await _local.GetCloudSettingsAsync();
             UpdateIdentityUi(settings);
             var local = await _local.LoadLatestAsync();
             if (local is not null) ShowData(local);
+            _serverReachable = await _sync.IsServerReachableAsync(IdentityLoginService.ApiOrigin);
+            SetConnection(_serverReachable);
             if (!settings.UsesUnifiedIdentity)
             {
-                SetConnection(null);
                 _statusText.Text = local is null
                     ? "本地模式 · 点击“统一认证登录”后可同步"
-                    : "本地记录已就绪 · 请使用统一认证登录";
+                    : "本地记录已就绪 · 尚未登录云端，点击“一键上传”将自动登录并补传";
                 return;
             }
             _statusText.Text = "正在检查星迹服务…";
-            _serverReachable = await _sync.IsServerReachableAsync(settings.BaseUrl);
-            SetConnection(_serverReachable);
             if (_serverReachable && !string.IsNullOrWhiteSpace(settings.AccessToken))
             {
                 var uploaded = await FlushPendingAsync(settings);
@@ -372,7 +381,9 @@ public sealed partial class MainWindow : Window
             }
             else _statusText.Text = local is null ? "服务在线，等待读取记录" : "本地记录已就绪；登录后可同步";
         }
+        catch (CloudAuthenticationException ex) { await HandleAuthenticationFailureAsync(ex); }
         catch (Exception ex) { _statusText.Text = $"本地初始化失败：{ex.Message}"; }
+        finally { SetBusy(false); }
     }
 
     private async void AutoFetchButton_Click(object sender, RoutedEventArgs e)
@@ -384,6 +395,7 @@ public sealed partial class MainWindow : Window
             var url = await _discovery.DiscoverAsync(CurrentGame, progress);
             await FetchAndPersistAsync(url, progress);
         }
+        catch (CloudAuthenticationException ex) { await HandleAuthenticationFailureAsync(ex); }
         catch (Exception ex) { _statusText.Text = $"自动读取失败：{ex.Message}"; }
         finally { SetBusy(false); }
     }
@@ -393,6 +405,7 @@ public sealed partial class MainWindow : Window
         if (string.IsNullOrWhiteSpace(_manualUrlBox.Text)) { _statusText.Text = "请先填写记录链接"; return; }
         SetBusy(true);
         try { await FetchAndPersistAsync(_manualUrlBox.Text, new Progress<string>(message => _statusText.Text = message)); }
+        catch (CloudAuthenticationException ex) { await HandleAuthenticationFailureAsync(ex); }
         catch (Exception ex) { _statusText.Text = $"读取失败：{ex.Message}"; }
         finally { SetBusy(false); }
     }
@@ -413,7 +426,8 @@ public sealed partial class MainWindow : Window
         var settings = await _local.GetCloudSettingsAsync();
         if (!settings.UsesUnifiedIdentity)
         {
-            _statusText.Text = $"已安全保存在本机 · UID {_current.Uid} · {_current.Records.Count} 条";
+            UpdateIdentityUi(settings);
+            _statusText.Text = $"已保存 {_current.Records.Count} 条并加入待上传队列 · 尚未登录云端，请点击“一键上传”";
             return;
         }
         await _local.QueueSyncAsync(_current.Game, _current.Uid);
@@ -431,11 +445,26 @@ public sealed partial class MainWindow : Window
     }
 
     private async void SyncButton_Click(object sender, RoutedEventArgs e)
+        => await UploadLocalAsync(false);
+
+    private async void UploadAllButton_Click(object sender, RoutedEventArgs e)
+        => await UploadLocalAsync(true);
+
+    private async Task UploadLocalAsync(bool uploadAll)
     {
         SetBusy(true);
         try
         {
             var settings = await _local.GetCloudSettingsAsync();
+            if (uploadAll)
+            {
+                await _local.QueueAllAccountsAsync();
+                if ((await _local.GetPendingAsync()).Count == 0)
+                {
+                    _statusText.Text = "没有可上传的本地记录，请先读取或导入记录。";
+                    return;
+                }
+            }
             _serverReachable = await _sync.IsServerReachableAsync(IdentityLoginService.ApiOrigin);
             SetConnection(_serverReachable);
             if (!_serverReachable)
@@ -452,12 +481,14 @@ public sealed partial class MainWindow : Window
                 await _local.SaveIdentitySettingsAsync(login);
                 settings = await _local.GetCloudSettingsAsync();
                 UpdateIdentityUi(settings);
+                await _local.QueueAllAccountsAsync();
             }
             if (_current is not null) await _local.QueueSyncAsync(_current.Game, _current.Uid);
             var uploaded = await FlushPendingAsync(settings);
-            _statusText.Text = $"已登录 {settings.Username}，同步完成，共写入 {uploaded} 条记录";
+            _statusText.Text = $"已登录 {settings.Username} · 云端已确认 {uploaded} 条记录，待上传队列已完成";
         }
         catch (OperationCanceledException) { _statusText.Text = "已取消统一认证，本地记录保持不变。"; }
+        catch (CloudAuthenticationException ex) { await HandleAuthenticationFailureAsync(ex); }
         catch (Exception ex) { _statusText.Text = $"同步失败，记录仍保留在本机：{ex.Message}"; }
         finally
         {
@@ -485,11 +516,43 @@ public sealed partial class MainWindow : Window
 
     private void UpdateIdentityUi(CloudSettings settings)
     {
+        _hasUnifiedLogin = settings.UsesUnifiedIdentity;
         if (_syncButton.Content is StackPanel panel && panel.Children.LastOrDefault() is TextBlock label)
             label.Text = settings.UsesUnifiedIdentity ? "同步记录" : "统一认证登录";
         _logoutButton.Visibility = settings.UsesUnifiedIdentity ? Visibility.Visible : Visibility.Collapsed;
         ToolTipService.SetToolTip(_syncButton, settings.UsesUnifiedIdentity
             ? $"当前账号：{settings.Username}" : "使用 Ishidadao ID 登录星迹");
+        SetConnection(_connectionOnline);
+    }
+
+    private async Task HandleAuthenticationFailureAsync(CloudAuthenticationException error)
+    {
+        await _local.ClearCloudLoginAsync();
+        UpdateIdentityUi(await _local.GetCloudSettingsAsync());
+        _statusText.Text = error.Message;
+    }
+
+    private async void BackupButton_Click(object sender, RoutedEventArgs e)
+    {
+        SetBusy(true);
+        try
+        {
+            var accounts = await _local.GetAllAccountsAsync();
+            if (accounts.Count == 0)
+            {
+                _statusText.Text = "没有可导出的本地记录。";
+                return;
+            }
+            var picker = new FileSavePicker { SuggestedFileName = $"StarTrace-backup-{DateTime.Now:yyyyMMdd-HHmmss}" };
+            picker.FileTypeChoices.Add("星迹完整备份 JSON", [".json"]);
+            InitializeWithWindow.Initialize(picker, WindowNative.GetWindowHandle(this));
+            var file = await picker.PickSaveFileAsync();
+            if (file is null) return;
+            await File.WriteAllTextAsync(file.Path, BackupService.Serialize(accounts));
+            _statusText.Text = $"已导出 {accounts.Count} 个游戏账号、{accounts.Sum(account => account.Records.Count)} 条记录（不含登录凭据）";
+        }
+        catch (Exception ex) { _statusText.Text = $"完整导出失败：{ex.Message}"; }
+        finally { SetBusy(false); }
     }
 
     private async void ImportButton_Click(object sender, RoutedEventArgs e)
@@ -516,6 +579,7 @@ public sealed partial class MainWindow : Window
             }
             else _statusText.Text = $"UIGF 已按 {groups.Count} 个 UID 分组导入本机 · {imported} 条";
         }
+        catch (CloudAuthenticationException ex) { await HandleAuthenticationFailureAsync(ex); }
         catch (Exception ex) { _statusText.Text = $"UIGF 导入失败：{ex.Message}"; }
         finally { SetBusy(false); }
     }
@@ -533,15 +597,8 @@ public sealed partial class MainWindow : Window
     {
         if ((await _local.GetPendingAsync()).Count == 0) return 0;
         settings = await RefreshIdentityIfNeededAsync(settings);
-        var total = 0;
-        foreach (var pending in await _local.GetPendingAsync())
-        {
-            var account = await _local.LoadAccountAsync(pending.Game, pending.Uid);
-            if (account is null) { await _local.MarkSyncedAsync(pending.Game, pending.Uid); continue; }
-            total += await _sync.UploadAsync(settings.BaseUrl, settings.AccessToken, account.Game, account.Records);
-            await _local.MarkSyncedAsync(account.Game, account.Uid);
-        }
-        return total;
+        return await new CloudTransferService(_local, _sync).UploadPendingAsync(
+            settings, new Progress<string>(message => _statusText.Text = message));
     }
 
     private async Task<CloudSettings> RefreshIdentityIfNeededAsync(CloudSettings settings)
@@ -739,6 +796,9 @@ public sealed partial class MainWindow : Window
         _autoFetchButton.IsEnabled = !busy;
         _manualFetchButton.IsEnabled = !busy;
         _syncButton.IsEnabled = !busy;
+        _uploadAllButton.IsEnabled = !busy;
+        _backupButton.IsEnabled = !busy;
+        _gameSelector.IsEnabled = !busy;
         _logoutButton.IsEnabled = !busy;
         _importButton.IsEnabled = !busy && CurrentGame == "genshin";
         _exportButton.IsEnabled = !busy && _current?.Game == "genshin";
@@ -747,10 +807,12 @@ public sealed partial class MainWindow : Window
 
     private void SetConnection(bool? online)
     {
-        _connectionDot.Fill = Brush(online switch { true => "#59C5A8", false => "#D59A58", null => "#999CAF" });
+        _connectionOnline = online;
+        _connectionDot.Fill = Brush(online switch { true when _hasUnifiedLogin => "#59C5A8", true => "#D59A58", false => "#D59A58", null => "#999CAF" });
         _connectionText.Text = online switch
         {
-            true => "星迹服务在线",
+            true when _hasUnifiedLogin => "服务在线 · 已登录",
+            true => "服务在线 · 未登录云端",
             false => "离线模式 · 本地保存",
             null => "未登录 · 本地模式",
         };

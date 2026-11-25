@@ -65,6 +65,8 @@ public sealed class LocalDataService
                 account.Records,
                 normalizedIncoming);
             account.UpdatedAt = DateTimeOffset.UtcNow;
+            if (!state.Pending.Any(item => item.Game == incoming.Game && item.Uid == incoming.Uid))
+                state.Pending.Add(new PendingAccount { Game = incoming.Game, Uid = incoming.Uid });
             await WriteUnlockedAsync(state, token);
             return new FetchResult(account.Game, account.Uid, account.Records);
         }
@@ -85,6 +87,17 @@ public sealed class LocalDataService
 
     public async Task<IReadOnlyList<PendingAccount>> GetPendingAsync(CancellationToken token = default) =>
         (await ReadAsync(token)).Pending.ToList();
+
+    public async Task<IReadOnlyList<FetchResult>> GetAllAccountsAsync(CancellationToken token = default) =>
+        (await ReadAsync(token)).Accounts.Select(account =>
+            new FetchResult(account.Game, account.Uid, account.Records.ToList())).ToList();
+
+    public Task QueueAllAccountsAsync(CancellationToken token = default) => UpdateAsync(state =>
+    {
+        foreach (var account in state.Accounts.Where(account => account.Records.Count > 0))
+            if (!state.Pending.Any(item => item.Game == account.Game && item.Uid == account.Uid))
+                state.Pending.Add(new PendingAccount { Game = account.Game, Uid = account.Uid });
+    }, token);
 
     public async Task SaveIdentitySettingsAsync(IdentityLogin login, CancellationToken token = default)
     {

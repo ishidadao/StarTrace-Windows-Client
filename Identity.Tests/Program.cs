@@ -8,6 +8,8 @@ using StarTrace.Client.Services;
 using StarTrace.Client.Models;
 
 static void Check(bool value, string name) { if (!value) throw new Exception(name); Console.WriteLine("PASS " + name); }
+await WorkflowTests.CheckSdkBrowserAsync();
+await WorkflowTests.CheckTransfersAsync();
 using var rsa = RSA.Create(2048);
 var key = new RsaSecurityKey(rsa) { KeyId = "test-key" };
 var jwk = JsonWebKeyConverter.ConvertFromRSASecurityKey(key);

@@ -4,9 +4,10 @@ using StarTrace.Client.Models;
 
 namespace StarTrace.Client.Services;
 
-public sealed class CloudSyncService(HttpClient client) : IDisposable
+public sealed class CloudSyncService(HttpClient client, HttpClient? authenticatedClient = null) : IDisposable
 {
-    private readonly HttpClient _apiClient = new(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(45) };
+    private readonly HttpClient _apiClient = authenticatedClient ??
+        new HttpClient(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(45) };
     public static bool TryNormalizeBaseUrl(string? value, out string normalized)
     {
         normalized = "";
@@ -75,7 +76,7 @@ public sealed class CloudSyncService(HttpClient client) : IDisposable
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
             using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
-            return (int)response.StatusCode < 500;
+            return response.IsSuccessStatusCode;
         }
         catch { return false; }
     }
@@ -94,19 +95,52 @@ public sealed class CloudSyncService(HttpClient client) : IDisposable
         foreach (var group in groups)
         {
             if (string.IsNullOrWhiteSpace(group.Key.Uid)) throw new InvalidDataException("记录中存在空 UID，已停止上传。");
-            var payload = new { game = group.Key.Game, uid = group.Key.Uid, source = "winui-client", records = group.ToList() };
-            using var request = new HttpRequestMessage(HttpMethod.Post, endpoint) { Content = JsonContent.Create(payload) };
-            request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken.Trim());
-            using var response = await _apiClient.SendAsync(request, token);
-            var responseText = await response.Content.ReadAsStringAsync(token);
-            if (!response.IsSuccessStatusCode)
+            foreach (var batch in UploadBatches(game, group))
             {
-                throw new InvalidOperationException(ReadError(responseText, "同步失败。"));
+                var payload = new { game = group.Key.Game, uid = group.Key.Uid, source = "winui-client", records = batch };
+                using var request = new HttpRequestMessage(HttpMethod.Post, endpoint) { Content = JsonContent.Create(payload) };
+                request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken.Trim());
+                using var response = await _apiClient.SendAsync(request, token);
+                var responseText = await response.Content.ReadAsStringAsync(token);
+                if (!response.IsSuccessStatusCode)
+                {
+                    if (response.StatusCode is System.Net.HttpStatusCode.Unauthorized or System.Net.HttpStatusCode.Forbidden)
+                        throw new CloudAuthenticationException("云端拒绝了登录凭据，请重新统一认证；待上传记录已保留。");
+                    throw new InvalidOperationException(ReadError(responseText, "同步失败。"));
+                }
+                using var json = JsonDocument.Parse(responseText);
+                var written = json.RootElement.GetProperty("written").GetInt32();
+                var ignored = json.RootElement.TryGetProperty("ignoredDuplicates", out var duplicates) ? duplicates.GetInt32() : 0;
+                if (written + ignored != batch.Length)
+                    throw new InvalidDataException("云端未确认全部记录，已保留待上传队列供重试。");
+                total += batch.Length;
             }
-            using var json = JsonDocument.Parse(responseText);
-            total += json.RootElement.GetProperty("written").GetInt32();
         }
         return total;
+    }
+
+    private static IEnumerable<GachaRecord[]> UploadBatches(string game, IEnumerable<GachaRecord> records)
+    {
+        if (game != "wuwa")
+        {
+            foreach (var chunk in records.Chunk(1000)) yield return chunk;
+            yield break;
+        }
+        // The server deduplicates WuWa by natural identity and multiplicity.
+        // Splitting a same-second ten-pull across requests can lose repeat items.
+        var buffer = new List<GachaRecord>();
+        foreach (var timestamp in records.GroupBy(record => record.PulledAt))
+        {
+            var group = timestamp.ToArray();
+            if (group.Length > 10000) throw new InvalidDataException("同一时间的记录超过服务器批次上限，已保留待上传数据。");
+            if (buffer.Count > 0 && buffer.Count + group.Length > 1000)
+            {
+                yield return buffer.ToArray();
+                buffer.Clear();
+            }
+            buffer.AddRange(group);
+        }
+        if (buffer.Count > 0) yield return buffer.ToArray();
     }
 
     private static string ReadError(string responseText, string fallback)
@@ -131,3 +165,5 @@ public sealed class CloudSyncService(HttpClient client) : IDisposable
 
     public void Dispose() => _apiClient.Dispose();
 }
+
+public sealed class CloudAuthenticationException(string message) : InvalidOperationException(message);

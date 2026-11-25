@@ -11,5 +11,7 @@
     <Compile Include="../StarTrace.Client/Models/GachaPools.cs" Link="GachaPools.cs" />
     <Compile Include="../StarTrace.Client/Services/RecordMergePolicy.cs" Link="RecordMergePolicy.cs" />
     <Compile Include="../StarTrace.Client/Services/WutheringWavesRecordIdentity.cs" Link="WutheringWavesRecordIdentity.cs" />
+    <Compile Include="../StarTrace.Client/Services/BackupService.cs" Link="BackupService.cs" />
+    <Compile Include="../StarTrace.Client/Services/CloudTransferService.cs" Link="CloudTransferService.cs" />
   </ItemGroup>
 </Project>

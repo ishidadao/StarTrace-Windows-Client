@@ -15,24 +15,28 @@ namespace StarTrace.Client.Services;
 
 public sealed record IdentityLogin(string AccessToken, string RefreshToken, DateTimeOffset ExpiresAt, string Username);
 
-public sealed class IdentityLoginService
+public sealed class IdentityLoginService(Func<LoopbackBrowser>? browserFactory = null, HttpMessageHandler? backchannelHandler = null)
 {
     public const string Issuer = "https://id.ishidadao.ltd";
     public const string ClientId = "startrace-windows";
     public const string ApiOrigin = "https://startrace.ishidadao.ltd";
 
-    private static OidcClient CreateClient(string redirectUri, IBrowser? browser = null, string? nonce = null) => new(new OidcClientOptions
+    private OidcClient CreateClient(string redirectUri, IBrowser? browser = null, string? nonce = null) => new(new OidcClientOptions
     {
         Authority = Issuer, ClientId = ClientId, RedirectUri = redirectUri,
         Scope = "openid profile email offline_access", Browser = browser,
         ClockSkew = TimeSpan.FromSeconds(30), BackchannelTimeout = TimeSpan.FromSeconds(20),
         IdentityTokenValidator = new SignedIdentityTokenValidator(nonce),
         RefreshDiscoveryOnSignatureFailure = true,
+        // The issuer advertises optional PAR, but rejects this public client's
+        // pushed request before IBrowser runs. Use its supported code + PKCE flow.
+        DisablePushedAuthorization = true,
+        BackchannelHandler = backchannelHandler,
     });
 
     public async Task<IdentityLogin> LoginAsync(CancellationToken cancellationToken = default)
     {
-        using var browser = new LoopbackBrowser();
+        using var browser = browserFactory?.Invoke() ?? new LoopbackBrowser();
         var nonce = Base64UrlEncoder.Encode(RandomNumberGenerator.GetBytes(32));
         var client = CreateClient(browser.RedirectUri, browser, nonce);
         var result = await client.LoginAsync(new LoginRequest
@@ -41,7 +45,16 @@ public sealed class IdentityLoginService
             FrontChannelExtraParameters = new Parameters { { "nonce", nonce }, { "prompt", "consent" } },
         }, cancellationToken);
         cancellationToken.ThrowIfCancellationRequested();
-        if (result.IsError) throw new InvalidOperationException("统一身份登录未完成，请检查浏览器授权、访问组或重新登录。");
+        if (result.IsError) throw new InvalidOperationException(result.Error switch
+        {
+            "Timeout" => "统一认证等待超时，请重新登录。",
+            "UserCancel" => "统一认证已取消。",
+            "invalid_request" => "认证服务拒绝了授权请求，请更新客户端后重试（invalid_request）。",
+            "invalid_client" => "Windows 客户端尚未获准接入认证服务（invalid_client）。",
+            "access_denied" => "账号未获准访问星迹，请确认 startrace-users 权限。",
+            "不可信的登录地址。" => "生成的登录链接缺少必要的安全参数，浏览器尚未启动。",
+            _ => "统一认证未完成，请重试；若浏览器没有打开，请检查默认浏览器设置。",
+        });
         if (string.IsNullOrWhiteSpace(result.AccessToken) || string.IsNullOrWhiteSpace(result.RefreshToken))
             throw new InvalidOperationException("身份平台未返回完整令牌，请重新授权 offline_access。");
         return new IdentityLogin(result.AccessToken, result.RefreshToken, result.AccessTokenExpiration.ToUniversalTime(),
@@ -51,7 +64,9 @@ public sealed class IdentityLoginService
     public async Task<IdentityLogin> RefreshAsync(string refreshToken, string username, CancellationToken cancellationToken = default)
     {
         var result = await CreateClient("http://127.0.0.1/oauth/callback").RefreshTokenAsync(refreshToken, cancellationToken: cancellationToken);
-        if (result.IsError) throw new InvalidOperationException("统一认证登录已失效，请退出登录后重新认证。本地记录不会删除。");
+        if (result.IsError && result.Error is "invalid_grant" or "access_denied" or "invalid_client")
+            throw new CloudAuthenticationException("统一认证登录已失效，请重新登录；待上传记录已保留。");
+        if (result.IsError) throw new InvalidOperationException("暂时无法刷新登录，请检查网络后重试；本地记录和登录凭据已保留。");
         return new IdentityLogin(result.AccessToken, string.IsNullOrEmpty(result.RefreshToken) ? refreshToken : result.RefreshToken,
             DateTimeOffset.UtcNow.AddSeconds(result.ExpiresIn), username);
     }
